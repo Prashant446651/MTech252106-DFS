@@ -10,12 +10,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var storageDir string
 var port string
 var nodeName string
 var metadataURL string
+var peerURLs []string
 
 func validFileName(name string) bool {
 	return name != "" &&
@@ -40,7 +42,9 @@ func registerMetadata(fileName string, fileSize int64) error {
 	params.Set("path", absolutePath)
 	params.Set("size", strconv.FormatInt(fileSize, 10))
 
-	resp, err := http.Get(metadataURL + "/add?" + params.Encode())
+	resp, err := http.Get(
+		metadataURL + "/add?" + params.Encode(),
+	)
 	if err != nil {
 		return fmt.Errorf("metadata server unavailable: %w", err)
 	}
@@ -54,16 +58,76 @@ func registerMetadata(fileName string, fileSize int64) error {
 
 	return nil
 }
+func registerNodeWithMetadata() error {
+	params := url.Values{}
+	params.Set("node", nodeName)
+	params.Set("address", "localhost:"+port)
+
+	resp, err := http.Get(
+		metadataURL + "/register-node?" + params.Encode(),
+	)
+	if err != nil {
+		return fmt.Errorf("metadata server unavailable: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("node registration failed: %s",
+			strings.TrimSpace(string(body)))
+	}
+
+	return nil
+}
+
+func replicateToPeer(peerURL, fileName, filePath string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	endpoint := strings.TrimRight(peerURL, "/") +
+		"/upload?name=" + url.QueryEscape(fileName)
+
+	req, err := http.NewRequest(http.MethodPost, endpoint, file)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("cannot contact peer: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("peer returned HTTP %d: %s",
+			resp.StatusCode,
+			strings.TrimSpace(string(body)))
+	}
+
+	return nil
+}
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Use POST to upload", http.StatusMethodNotAllowed)
+		http.Error(w, "Use POST to upload",
+			http.StatusMethodNotAllowed)
 		return
 	}
 
 	fileName := r.URL.Query().Get("name")
 	if !validFileName(fileName) {
-		http.Error(w, "Invalid file name", http.StatusBadRequest)
+		http.Error(w, "Invalid file name",
+			http.StatusBadRequest)
 		return
 	}
 
@@ -74,6 +138,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	filePath := filepath.Join(storageDir, fileName)
+
 	file, err := os.Create(filePath)
 	if err != nil {
 		http.Error(w, "Cannot create file: "+err.Error(),
@@ -89,32 +154,52 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 			http.StatusInternalServerError)
 		return
 	}
+
 	if closeErr != nil {
 		http.Error(w, "Cannot close file: "+closeErr.Error(),
 			http.StatusInternalServerError)
 		return
 	}
 
-	// Register the file after it has been saved.
+	// Register the local copy in the metadata database.
 	if err := registerMetadata(fileName, fileSize); err != nil {
 		http.Error(w,
-			"File saved, but metadata registration failed: "+err.Error(),
+			"File saved locally, but metadata registration failed: "+
+				err.Error(),
 			http.StatusBadGateway)
 		return
 	}
 
-	fmt.Fprintf(w, "File uploaded and metadata registered: %s\n", fileName)
+	// Send a copy to each configured peer.
+	for _, peerURL := range peerURLs {
+		if err := replicateToPeer(
+			peerURL, fileName, filePath,
+		); err != nil {
+			http.Error(w,
+				"File saved on "+nodeName+
+					", but replication to "+peerURL+
+					" failed: "+err.Error(),
+				http.StatusBadGateway)
+			return
+		}
+	}
+
+	fmt.Fprintf(w,
+		"File uploaded successfully on %s; replication to configured peers completed: %s\n",
+		nodeName, fileName)
 }
 
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "Use GET to download", http.StatusMethodNotAllowed)
+		http.Error(w, "Use GET to download",
+			http.StatusMethodNotAllowed)
 		return
 	}
 
 	fileName := r.URL.Query().Get("name")
 	if !validFileName(fileName) {
-		http.Error(w, "Invalid file name", http.StatusBadRequest)
+		http.Error(w, "Invalid file name",
+			http.StatusBadRequest)
 		return
 	}
 
@@ -127,18 +212,21 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Disposition",
 		`attachment; filename="`+fileName+`"`)
+
 	http.ServeFile(w, r, filePath)
 }
 
 func deleteHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
-		http.Error(w, "Use DELETE to delete", http.StatusMethodNotAllowed)
+		http.Error(w, "Use DELETE to delete",
+			http.StatusMethodNotAllowed)
 		return
 	}
 
 	fileName := r.URL.Query().Get("name")
 	if !validFileName(fileName) {
-		http.Error(w, "Invalid file name", http.StatusBadRequest)
+		http.Error(w, "Invalid file name",
+			http.StatusBadRequest)
 		return
 	}
 
@@ -149,8 +237,8 @@ func deleteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Metadata cleanup is not yet implemented.
-	fmt.Fprintf(w, "File deleted from %s: %s\n", nodeName, fileName)
+	fmt.Fprintf(w, "File deleted from %s: %s\n",
+		nodeName, fileName)
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -178,7 +266,15 @@ func main() {
 			nodeName = os.Args[i+1]
 			i++
 		case "--metadata":
-			metadataURL = strings.TrimRight(os.Args[i+1], "/")
+			metadataURL = strings.TrimRight(
+				os.Args[i+1], "/",
+			)
+			i++
+		case "--peer":
+			peerURLs = append(
+				peerURLs,
+				strings.TrimRight(os.Args[i+1], "/"),
+			)
 			i++
 		default:
 			log.Fatal("Unknown option: ", os.Args[i])
@@ -203,6 +299,11 @@ func main() {
 	log.Println("Port:", port)
 	log.Println("Storage directory:", storageDir)
 	log.Println("Metadata Server:", metadataURL)
-
+	log.Println("Replication peers:", peerURLs)
+	if err := registerNodeWithMetadata(); err != nil {
+		log.Printf("WARNING: could not register node: %v", err)
+	} else {
+		log.Println("Registered with metadata server")
+	}
 	log.Fatal(http.ListenAndServe(":"+port, mux))
 }

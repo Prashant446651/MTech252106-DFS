@@ -4,11 +4,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -25,6 +28,19 @@ type FileMetadata struct {
 	Replicas []ReplicaInfo `json:"replicas"`
 }
 
+type NodeStatus struct {
+	Node      string `json:"node"`
+	Address   string `json:"address"`
+	Status    string `json:"status"`
+	LastSeen  string `json:"last_seen,omitempty"`
+	LastError string `json:"last_error,omitempty"`
+}
+
+type RegisteredNode struct {
+	Node    string
+	Address string
+}
+
 var (
 	db   *sql.DB
 	dbMu sync.Mutex
@@ -38,7 +54,6 @@ func initializeDatabase() error {
 		return err
 	}
 
-	// SQLite can safely handle our small project workload.
 	db.SetMaxOpenConns(1)
 
 	_, err = db.Exec(`
@@ -59,6 +74,14 @@ func initializeDatabase() error {
 				REFERENCES files(name)
 				ON DELETE CASCADE
 		);
+
+		CREATE TABLE IF NOT EXISTS nodes (
+			node TEXT PRIMARY KEY,
+			address TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'unknown',
+			last_seen TEXT,
+			last_error TEXT NOT NULL DEFAULT ''
+		);
 	`)
 	if err != nil {
 		return err
@@ -67,11 +90,46 @@ func initializeDatabase() error {
 	return db.Ping()
 }
 
-// Add or update metadata when a storage node uploads a file.
-// Compatible with the Storage Node's GET /add request.
+// Register a storage node when it starts.
+func registerNodeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "Use GET or POST",
+			http.StatusMethodNotAllowed)
+		return
+	}
+
+	node := r.URL.Query().Get("node")
+	address := r.URL.Query().Get("address")
+
+	if node == "" || address == "" {
+		http.Error(w, "Missing node or address",
+			http.StatusBadRequest)
+		return
+	}
+
+	dbMu.Lock()
+	defer dbMu.Unlock()
+
+	_, err := db.Exec(`
+		INSERT INTO nodes(node, address, status, last_error)
+		VALUES(?, ?, 'unknown', '')
+		ON CONFLICT(node) DO UPDATE SET
+			address = excluded.address
+	`, node, address)
+	if err != nil {
+		http.Error(w, "Cannot register node",
+			http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Fprintf(w, "Node registered: %s\n", node)
+}
+
+// Register or update file and replica metadata.
 func addFileHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		http.Error(w, "Use GET or POST", http.StatusMethodNotAllowed)
+		http.Error(w, "Use GET or POST",
+			http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -90,7 +148,8 @@ func addFileHandler(w http.ResponseWriter, r *http.Request) {
 
 	size, err := strconv.ParseInt(sizeText, 10, 64)
 	if err != nil || size < 0 {
-		http.Error(w, "Invalid file size", http.StatusBadRequest)
+		http.Error(w, "Invalid file size",
+			http.StatusBadRequest)
 		return
 	}
 
@@ -99,7 +158,8 @@ func addFileHandler(w http.ResponseWriter, r *http.Request) {
 
 	tx, err := db.Begin()
 	if err != nil {
-		http.Error(w, "Database error", http.StatusInternalServerError)
+		http.Error(w, "Database error",
+			http.StatusInternalServerError)
 		return
 	}
 	defer tx.Rollback()
@@ -107,7 +167,8 @@ func addFileHandler(w http.ResponseWriter, r *http.Request) {
 	_, err = tx.Exec(`
 		INSERT INTO files(name, size)
 		VALUES(?, ?)
-		ON CONFLICT(name) DO UPDATE SET size = excluded.size
+		ON CONFLICT(name) DO UPDATE SET
+			size = excluded.size
 	`, name, size)
 	if err != nil {
 		http.Error(w, "Cannot save file metadata",
@@ -115,8 +176,18 @@ func addFileHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A file can have one replica per node.
-	// Re-uploading on the same node updates that node's record.
+	_, err = tx.Exec(`
+		INSERT INTO nodes(node, address, status, last_error)
+		VALUES(?, ?, 'unknown', '')
+		ON CONFLICT(node) DO UPDATE SET
+			address = excluded.address
+	`, node, address)
+	if err != nil {
+		http.Error(w, "Cannot register storage node",
+			http.StatusInternalServerError)
+		return
+	}
+
 	_, err = tx.Exec(`
 		INSERT INTO replicas(file_name, node, address, path)
 		VALUES(?, ?, ?, ?)
@@ -136,13 +207,15 @@ func addFileHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Fprintf(w, "Metadata registered for %s on %s\n", name, node)
+	fmt.Fprintf(w, "Metadata registered for %s on %s\n",
+		name, node)
 }
 
 func getFileHandler(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
 	if name == "" {
-		http.Error(w, "Missing file name", http.StatusBadRequest)
+		http.Error(w, "Missing file name",
+			http.StatusBadRequest)
 		return
 	}
 
@@ -153,11 +226,13 @@ func getFileHandler(w http.ResponseWriter, r *http.Request) {
 	).Scan(&result.Name, &result.Size)
 
 	if err == sql.ErrNoRows {
-		http.Error(w, "File metadata not found", http.StatusNotFound)
+		http.Error(w, "File metadata not found",
+			http.StatusNotFound)
 		return
 	}
 	if err != nil {
-		http.Error(w, "Database error", http.StatusInternalServerError)
+		http.Error(w, "Database error",
+			http.StatusInternalServerError)
 		return
 	}
 
@@ -179,7 +254,9 @@ func getFileHandler(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var replica ReplicaInfo
 		if err := rows.Scan(
-			&replica.Node, &replica.Address, &replica.Path,
+			&replica.Node,
+			&replica.Address,
+			&replica.Path,
 		); err != nil {
 			http.Error(w, "Cannot read replica",
 				http.StatusInternalServerError)
@@ -201,7 +278,8 @@ func getFileHandler(w http.ResponseWriter, r *http.Request) {
 func listFilesHandler(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query("SELECT name FROM files ORDER BY name")
 	if err != nil {
-		http.Error(w, "Database error", http.StatusInternalServerError)
+		http.Error(w, "Database error",
+			http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
@@ -228,13 +306,166 @@ func listFilesHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(names)
 }
 
+// Return all registered nodes and their latest health status.
+func nodesHandler(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT node, address, status,
+		       COALESCE(last_seen, ''),
+		       COALESCE(last_error, '')
+		FROM nodes
+		ORDER BY node
+	`)
+	if err != nil {
+		http.Error(w, "Cannot read node status",
+			http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	nodes := []NodeStatus{}
+
+	for rows.Next() {
+		var n NodeStatus
+		if err := rows.Scan(
+			&n.Node,
+			&n.Address,
+			&n.Status,
+			&n.LastSeen,
+			&n.LastError,
+		); err != nil {
+			http.Error(w, "Cannot read node record",
+				http.StatusInternalServerError)
+			return
+		}
+		nodes = append(nodes, n)
+	}
+
+	if err := rows.Err(); err != nil {
+		http.Error(w, "Cannot read nodes",
+			http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(nodes)
+}
+
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	if err := db.Ping(); err != nil {
 		http.Error(w, "Metadata database unavailable",
 			http.StatusInternalServerError)
 		return
 	}
+
 	fmt.Fprintln(w, "Metadata server is healthy")
+}
+
+// Check a storage node's /health endpoint.
+func checkNode(address string) error {
+	endpoint := strings.TrimRight(address, "/")
+
+	if !strings.HasPrefix(endpoint, "http://") &&
+		!strings.HasPrefix(endpoint, "https://") {
+		endpoint = "http://" + endpoint
+	}
+
+	endpoint += "/health"
+
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+	}
+
+	resp, err := client.Get(endpoint)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// Drain the response so the HTTP connection can be reused.
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("health check returned %s", resp.Status)
+	}
+
+	return nil
+}
+
+// Save the latest health-check result in SQLite.
+func updateNodeStatus(node, status, errorMessage string) {
+	dbMu.Lock()
+	defer dbMu.Unlock()
+
+	if status == "online" {
+		_, err := db.Exec(`
+			UPDATE nodes
+			SET status = ?, last_seen = ?, last_error = ''
+			WHERE node = ?
+		`, status, time.Now().Format(time.RFC3339), node)
+
+		if err != nil {
+			log.Printf("Cannot update status for %s: %v",
+				node, err)
+		}
+		return
+	}
+
+	_, err := db.Exec(`
+		UPDATE nodes
+		SET status = ?, last_error = ?
+		WHERE node = ?
+	`, status, errorMessage, node)
+
+	if err != nil {
+		log.Printf("Cannot update status for %s: %v",
+			node, err)
+	}
+}
+
+// Check every registered node.
+func checkNodesOnce() {
+	rows, err := db.Query(`
+		SELECT node, address FROM nodes ORDER BY node
+	`)
+	if err != nil {
+		log.Printf("Cannot load registered nodes: %v", err)
+		return
+	}
+
+	var registered []RegisteredNode
+
+	for rows.Next() {
+		var n RegisteredNode
+		if err := rows.Scan(&n.Node, &n.Address); err != nil {
+			log.Printf("Cannot read node: %v", err)
+			_ = rows.Close()
+			return
+		}
+		registered = append(registered, n)
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Printf("Error reading registered nodes: %v", err)
+	}
+	_ = rows.Close()
+
+	for _, n := range registered {
+		err := checkNode(n.Address)
+		if err != nil {
+			updateNodeStatus(n.Node, "offline", err.Error())
+		} else {
+			updateNodeStatus(n.Node, "online", "")
+		}
+	}
+}
+
+func nodeMonitorLoop() {
+	log.Println("Node monitor started; check interval: 5 seconds")
+
+	for {
+		checkNodesOnce()
+		time.Sleep(5 * time.Second)
+	}
 }
 
 func main() {
@@ -243,10 +474,15 @@ func main() {
 	}
 	defer db.Close()
 
-	http.HandleFunc("/add", addFileHandler)
-	http.HandleFunc("/get", getFileHandler)
-	http.HandleFunc("/list", listFilesHandler)
-	http.HandleFunc("/health", healthHandler)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/add", addFileHandler)
+	mux.HandleFunc("/get", getFileHandler)
+	mux.HandleFunc("/list", listFilesHandler)
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/register-node", registerNodeHandler)
+	mux.HandleFunc("/nodes", nodesHandler)
+
+	go nodeMonitorLoop()
 
 	port := os.Getenv("METADATA_PORT")
 	if port == "" {
@@ -256,5 +492,5 @@ func main() {
 	log.Println("Metadata Server listening on port", port)
 	log.Println("SQLite database: ./metadata.db")
 
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	log.Fatal(http.ListenAndServe(":"+port, mux))
 }
