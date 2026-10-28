@@ -20,6 +20,7 @@ var port string
 var nodeName string
 var metadataURL string
 var peerURLs []string
+var advertiseURL string
 
 func validFileName(name string) bool {
 	return name != "" && filepath.Base(name) == name && name != "." && name != ".." && !strings.ContainsAny(name, `/\\`)
@@ -65,7 +66,7 @@ func registerMetadata(fileName string, fileSize int64) error {
 	params := url.Values{}
 	params.Set("name", fileName)
 	params.Set("node", nodeName)
-	params.Set("address", "localhost:"+port)
+	params.Set("address", advertiseURL)
 	params.Set("path", absolutePath)
 	params.Set("size", strconv.FormatInt(fileSize, 10))
 	params.Set("sha256", checksum)
@@ -86,7 +87,7 @@ func registerRecoveredReplica(fileName string, fileSize int64) error {
 	params := url.Values{}
 	params.Set("name", fileName)
 	params.Set("node", nodeName)
-	params.Set("address", "localhost:"+port)
+	params.Set("address", advertiseURL)
 	params.Set("path", absolutePath)
 	params.Set("size", strconv.FormatInt(fileSize, 10))
 	params.Set("sha256", checksum)
@@ -96,8 +97,24 @@ func registerRecoveredReplica(fileName string, fileSize int64) error {
 func registerNodeWithMetadata() error {
 	params := url.Values{}
 	params.Set("node", nodeName)
-	params.Set("address", "localhost:"+port)
+	params.Set("address", advertiseURL)
 	return metadataGET("/register-node", params)
+}
+
+// If metadata is temporarily unavailable during startup, keep retrying
+// registration until it succeeds. This does not reset an already-online
+// node's status in a recurring timer.
+func retryNodeRegistrationUntilSuccess() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if err := registerNodeWithMetadata(); err != nil {
+			log.Printf("Node registration retry failed: %v", err)
+			continue
+		}
+		log.Println("Registered with metadata server after retry")
+		return
+	}
 }
 
 // Keep peer-to-peer copy support available, but mark it as a recovery upload so
@@ -133,7 +150,7 @@ func queueReplication(peerURL, fileName string) error {
 	params := url.Values{}
 	params.Set("name", fileName)
 	params.Set("source_node", nodeName)
-	params.Set("source_address", "localhost:"+port)
+	params.Set("source_address", advertiseURL)
 	params.Set("target_address", strings.TrimRight(peerURL, "/"))
 	return metadataGET("/queue-replication", params)
 }
@@ -263,6 +280,7 @@ func main() {
 	port = "8001"
 	nodeName = "node1"
 	metadataURL = "http://localhost:9000"
+	advertiseURL = strings.TrimRight(os.Getenv("DFS_ADVERTISE_URL"), "/")
 	for i := 1; i < len(os.Args); i++ {
 		if i+1 >= len(os.Args) {
 			log.Fatal("Missing value for option: ", os.Args[i])
@@ -280,12 +298,21 @@ func main() {
 		case "--metadata":
 			metadataURL = strings.TrimRight(os.Args[i+1], "/")
 			i++
+		case "--advertise":
+			advertiseURL = strings.TrimRight(os.Args[i+1], "/")
+			i++
 		case "--peer":
 			peerURLs = append(peerURLs, strings.TrimRight(os.Args[i+1], "/"))
 			i++
 		default:
 			log.Fatal("Unknown option: ", os.Args[i])
 		}
+	}
+	if advertiseURL == "" {
+		advertiseURL = "http://localhost:" + port
+	}
+	if !strings.HasPrefix(advertiseURL, "http://") && !strings.HasPrefix(advertiseURL, "https://") {
+		log.Fatal("--advertise must be a full http:// or https:// URL")
 	}
 	if storageDir == "" {
 		storageDir = filepath.Join("./data", nodeName)
@@ -300,11 +327,13 @@ func main() {
 	mux.HandleFunc("/health", healthHandler)
 	log.Println("Storage Node:", nodeName)
 	log.Println("Port:", port)
+	log.Println("Advertised address:", advertiseURL)
 	log.Println("Storage directory:", storageDir)
 	log.Println("Metadata Server:", metadataURL)
 	log.Println("Replication peers:", peerURLs)
 	if err := registerNodeWithMetadata(); err != nil {
 		log.Printf("WARNING: could not register node: %v", err)
+		go retryNodeRegistrationUntilSuccess()
 	} else {
 		log.Println("Registered with metadata server")
 	}

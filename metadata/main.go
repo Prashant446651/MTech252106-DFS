@@ -105,10 +105,18 @@ var (
 	deleteQueueMu sync.Mutex
 )
 
+func configuredDatabasePath() string {
+	path := strings.TrimSpace(os.Getenv("METADATA_DB"))
+	if path == "" {
+		return "./metadata.db"
+	}
+	return path
+}
+
 func initializeDatabase() error {
 	var err error
 
-	db, err = sql.Open("sqlite", "./metadata.db")
+	db, err = sql.Open("sqlite", configuredDatabasePath())
 	if err != nil {
 		return err
 	}
@@ -1581,7 +1589,7 @@ func main() {
 	}
 
 	log.Println("Metadata Server listening on port", port)
-	log.Println("SQLite database: ./metadata.db")
+	log.Println("SQLite database:", configuredDatabasePath())
 
 	log.Fatal(http.ListenAndServe(":"+port, mux))
 }
@@ -1820,7 +1828,11 @@ func processOneReplicationJob(job ReplicationJob) {
 		return
 	}
 	sources := make([]ReplicaInfo, 0, len(replicas))
+	targetAlreadyRegistered := false
 	for _, replica := range replicas {
+		if replica.Node == target.Node {
+			targetAlreadyRegistered = true
+		}
 		if replica.Node == target.Node || excludedNodes[replica.Node] {
 			continue
 		}
@@ -1837,6 +1849,19 @@ func processOneReplicationJob(job ReplicationJob) {
 		updateReplicationJobError(job.ID, "no online replica matches the canonical checksum")
 		return
 	}
+
+	// There may be four registered storage nodes even though the configured
+	// replication factor is three. Do not create an extra copy for a target
+	// that is not already recorded as a replica when enough verified copies
+	// already exist. If this target has a registered but corrupt/missing copy,
+	// continue so the existing replica can be repaired.
+	if !targetAlreadyRegistered && len(sources) >= desiredReplicationFactor {
+		deleteReplicationJob(job.ID)
+		log.Printf("Skipping extra replication for %s to %s: already have %d verified copies (target RF=%d)",
+			file.Name, target.Node, len(sources), desiredReplicationFactor)
+		return
+	}
+
 	sort.Slice(sources, func(i, j int) bool { return sources[i].Node < sources[j].Node })
 	if err := copyReplica(file.Name, sources[0], target); err != nil {
 		updateReplicationJobError(job.ID, err.Error())
